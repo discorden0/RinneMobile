@@ -1,0 +1,114 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/launcher_bg">
+
+    <com.apps.theme.LauncherParticleView
+        android:id="@+id/padLauncherParticleView"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:clickable="false"
+        android:focusable="false"
+        android:focusableInTouchMode="false"
+        android:importantForAccessibility="no"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent" />
+
+    <FrameLayout
+        android:id="@+id/padFragmentContainer"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent" />
+
+    <LinearLayout
+        android:id="@+id/padQuickActions"
+        android:layout_width="0dp"
+        android:layout_height="48dp"
+        android:layout_marginBottom="5dp"
+        android:clipChildren="false"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        android:paddingStart="30dp"
+        android:paddingEnd="30dp"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent">
+
+        <ImageView
+            android:id="@+id/navLaunchCenterIcon"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:clickable="true"
+            android:contentDescription="@string/game_center"
+            android:focusable="true"
+            android:padding="10dp"
+            android:scaleType="centerInside"
+            android:src="@drawable/pad_game_home_surface_icon" />
+
+        <ImageView
+            android:id="@+id/navSettingsIcon"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:layout_marginStart="4dp"
+            android:clickable="true"
+            android:contentDescription="@string/home_settings"
+            android:focusable="true"
+            android:padding="10dp"
+            android:scaleType="fitCenter"
+            android:src="@drawable/pad_game_settings_button" />
+
+        <ImageView
+            android:id="@+id/navScanGamesIcon"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:layout_marginStart="4dp"
+            android:clickable="true"
+            android:contentDescription="@string/game_scan_title"
+            android:focusable="true"
+            android:padding="10dp"
+            android:scaleType="centerInside"
+            android:src="@drawable/pad_game_scan_icon" />
+
+        <ImageView
+            android:id="@+id/navDiagnosticsIcon"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:layout_marginStart="4dp"
+            android:clickable="true"
+            android:contentDescription="@string/game_diagnostics_title"
+            android:focusable="true"
+            android:padding="10dp"
+            android:scaleType="centerInside"
+            android:src="@drawable/pad_game_diagnostics_icon" />
+
+        <ImageView
+            android:id="@+id/navToneSwitchIcon"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:layout_marginStart="4dp"
+            android:clickable="true"
+            android:contentDescription="@string/home_switch_tone"
+            android:focusable="true"
+            android:padding="10dp"
+            android:scaleType="centerInside"
+            android:src="@drawable/pad_game_tone_icon" />
+
+        <TextView
+            android:id="@+id/padDeviceStatus"
+            android:layout_width="wrap_content"
+            android:layout_height="48dp"
+            android:layout_marginStart="8dp"
+            android:gravity="center_vertical"
+            android:singleLine="true"
+            android:textColor="@color/launcher_text_muted_color"
+            android:textSize="12sp"
+            android:textStyle="bold" />
+    </LinearLayout>
+</androidx.constraintlayout.widget.ConstraintLayout>

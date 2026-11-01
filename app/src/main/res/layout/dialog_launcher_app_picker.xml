@@ -1,0 +1,90 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="16dp"
+    android:background="@drawable/launcher_dialog_bg">
+
+    <TextView
+        android:id="@+id/tvLauncherAppPickerTitle"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="@string/game_app_picker_title"
+        android:textColor="@color/launcher_text_color"
+        android:textSize="20sp"
+        android:textStyle="bold" />
+
+    <TextView
+        android:id="@+id/tvLauncherAppPickerHint"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="5dp"
+        android:text="@string/game_app_picker_reading"
+        android:textColor="@color/launcher_text_muted_color"
+        android:textSize="11sp" />
+
+    <com.apps.widget.LauncherEditText
+        android:id="@+id/etLauncherAppSearch"
+        android:layout_width="match_parent"
+        android:layout_height="38dp"
+        android:layout_marginTop="11dp"
+        android:background="@drawable/launcher_account_input"
+        android:hint="@string/game_app_picker_search_hint"
+        android:imeOptions="actionSearch"
+        android:inputType="text"
+        android:paddingStart="13dp"
+        android:paddingEnd="13dp"
+        android:singleLine="true"
+        android:textColor="@color/launcher_text_color"
+        android:textColorHint="@color/launcher_text_muted_color"
+        android:textSize="12sp" />
+
+    <FrameLayout
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1"
+        android:layout_marginTop="11dp">
+
+        <androidx.recyclerview.widget.RecyclerView
+            android:id="@+id/recyclerLauncherAppPicker"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:visibility="gone"
+            android:clipToPadding="false"
+            android:scrollbars="none"
+            android:paddingBottom="4dp" />
+
+        <LinearLayout
+            android:id="@+id/layoutLauncherAppLoading"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:orientation="vertical"
+            android:gravity="center">
+
+            <ProgressBar
+                android:layout_width="38dp"
+                android:layout_height="38dp"
+                android:indeterminate="true" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="11dp"
+                android:text="@string/game_app_picker_loading"
+                android:textColor="@color/launcher_text_muted_color"
+                android:textSize="12sp" />
+        </LinearLayout>
+    </FrameLayout>
+
+    <TextView
+        android:id="@+id/btnCloseLauncherAppPicker"
+        android:layout_width="match_parent"
+        android:layout_height="38dp"
+        android:layout_marginTop="11dp"
+        android:gravity="center"
+        android:text="@string/game_common_cancel"
+        android:textAllCaps="false"
+        android:textColor="@color/launcher_text_color"
+        android:textSize="13sp" />
+</LinearLayout>

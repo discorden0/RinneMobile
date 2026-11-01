@@ -1,0 +1,106 @@
+package com.apps.agent
+
+import android.graphics.Color
+import android.graphics.drawable.ColorDrawable
+import android.view.Gravity
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import android.widget.FrameLayout
+import android.widget.LinearLayout
+import androidx.recyclerview.widget.RecyclerView
+import com.apps.theme.LauncherTheme
+import com.core.R
+import com.core.agent.store.AgentConversationRepository
+import com.core.databinding.ItemLocalAgentEventBinding
+import com.core.util.TimeFormatUtil
+import kotlin.math.max
+
+/** Left/right message flow used by the independent agent workbench. */
+class LocalAgentMessageAdapter(
+    private val messages: List<AgentConversationRepository.Message>
+) : RecyclerView.Adapter<LocalAgentMessageAdapter.Holder>() {
+    override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): Holder = Holder(
+        ItemLocalAgentEventBinding.inflate(LayoutInflater.from(parent.context), parent, false)
+    ).also {
+        // Enable only after inflation: some framework builds dispatch this attribute too early.
+        it.binding.agentReasoningScroll.isNestedScrollingEnabled = true
+    }
+
+    override fun onBindViewHolder(holder: Holder, position: Int) {
+        val message = messages[position]
+        val user = message.role == "user"
+        val tool = message.role == "tool"
+        val reasoning = message.role == "reasoning"
+        val horizontalInset = LauncherTheme.dp(holder.itemView.context, 4)
+        val oppositeInset = LauncherTheme.dp(holder.itemView.context, if (reasoning) 18 else 54)
+        val binding = holder.binding
+        (binding.agentEventCard.layoutParams as FrameLayout.LayoutParams).apply {
+            gravity = if (user) Gravity.END else Gravity.START
+            width = if (reasoning) ViewGroup.LayoutParams.MATCH_PARENT else ViewGroup.LayoutParams.WRAP_CONTENT
+            leftMargin = if (user) oppositeInset else horizontalInset
+            rightMargin = if (user) horizontalInset else oppositeInset
+            binding.agentEventCard.layoutParams = this
+        }
+        binding.agentEventCard.background = if (user) {
+            LauncherTheme.solidPrimary(holder.itemView.context, 18f)
+        } else {
+            ColorDrawable(Color.TRANSPARENT)
+        }
+        val cardPadding = if (user) LauncherTheme.dp(holder.itemView.context, 14) else 0
+        binding.agentEventCard.setPadding(
+            cardPadding, if (user) LauncherTheme.dp(holder.itemView.context, 11) else LauncherTheme.dp(holder.itemView.context, 4),
+            cardPadding, if (user) LauncherTheme.dp(holder.itemView.context, 11) else LauncherTheme.dp(holder.itemView.context, 4)
+        )
+        binding.agentEventHeader.visibility = if (user || reasoning) View.GONE else View.VISIBLE
+        binding.agentEventContent.visibility = if (reasoning) View.GONE else View.VISIBLE
+        binding.agentReasoningContainer.visibility = if (reasoning) View.VISIBLE else View.GONE
+        if (reasoning) {
+            val follow = binding.agentReasoningScroll.childCount == 0 ||
+                binding.agentReasoningScroll.scrollY + binding.agentReasoningScroll.height + LauncherTheme.dp(holder.itemView.context, 24) >=
+                binding.agentReasoningScroll.getChildAt(0).height
+            binding.agentReasoningContainer.background = null
+            binding.agentReasoningState.text = binding.root.context.getString(
+                if (message.name == "streaming") R.string.social_agent_thinking
+                else R.string.social_agent_reasoning_complete
+            )
+            binding.agentReasoningState.setTextColor(LauncherTheme.textMuted(holder.itemView.context))
+            binding.agentReasoningContent.text = if (message.content.isEmpty()) {
+                binding.root.context.getString(R.string.social_agent_analyzing)
+            } else {
+                message.content
+            }
+            binding.agentReasoningContent.setTextColor(LauncherTheme.textMuted(holder.itemView.context))
+            if (follow && message.name == "streaming") {
+                binding.agentReasoningScroll.post { binding.agentReasoningScroll.fullScroll(View.FOCUS_DOWN) }
+            }
+        }
+        binding.agentEventTitle.text = binding.root.context.getString(
+            if (tool) R.string.social_agent_local_operation else R.string.social_agent_name
+        )
+        var meta = TimeFormatUtil.clock(message.createdAt)
+        if (tool && message.name.isNotEmpty()) meta += "  ·  ${message.name}"
+        binding.agentEventMeta.text = meta
+        binding.agentEventContent.text = if (message.content.isEmpty() && !user && !tool) {
+            binding.root.context.getString(R.string.social_agent_generating_result)
+        } else {
+            message.content
+        }
+        binding.agentEventContent.maxWidth = max(
+            LauncherTheme.dp(holder.itemView.context, 220), holder.itemView.resources.displayMetrics.widthPixels - LauncherTheme.dp(holder.itemView.context, 100)
+        )
+        (binding.agentEventContent.layoutParams as LinearLayout.LayoutParams).apply {
+            topMargin = if (user) 0 else LauncherTheme.dp(holder.itemView.context, 7)
+            binding.agentEventContent.layoutParams = this
+        }
+        binding.agentEventContent.setTextColor(
+            if (user) LauncherTheme.onPrimary(holder.itemView.context) else LauncherTheme.text(holder.itemView.context)
+        )
+        binding.agentEventTitle.setTextColor(LauncherTheme.text(holder.itemView.context))
+        binding.agentEventMeta.setTextColor(LauncherTheme.textMuted(holder.itemView.context))
+    }
+
+    override fun getItemCount(): Int = messages.size
+
+    class Holder(val binding: ItemLocalAgentEventBinding) : RecyclerView.ViewHolder(binding.root)
+}

@@ -1,0 +1,775 @@
+package com.core.data
+
+import android.content.ContentValues
+import android.content.Context
+import android.database.Cursor
+import android.database.sqlite.SQLiteDatabase
+import org.json.JSONArray
+import org.json.JSONObject
+
+import com.core.model.EngineType
+import com.core.model.Game
+
+import java.util.ArrayList
+import java.util.HashSet
+import java.util.Locale
+import java.util.UUID
+
+class GameRepository(context: Context) {
+    private val helper: YukiDatabaseHelper = YukiDatabaseHelper(context.applicationContext)
+    /** 游玩会话/时长职责委派（重构计划 3.5 拆分，共享同一 helper 保证事务原子性）。 */
+    private val playSessions = PlaySessionRepository(helper)
+
+    fun getAll(): List<Game> {
+        return getAll("last_played_at DESC, created_at DESC")
+    }
+
+    fun getAll(orderBy: String?): List<Game> {
+        val list = ArrayList<Game>()
+        val db = helper.readableDatabase
+        val c = db.query(
+            "games", null, "hidden=0", null, null, null,
+            if (orderBy == null || orderBy.trim().isEmpty()) "last_played_at DESC, created_at DESC" else orderBy
+        )
+        c.use {
+            while (it.moveToNext()) list.add(fromCursor(it))
+        }
+        return list
+    }
+
+    fun findById(id: Long): Game? {
+        if (id <= 0) return null
+        val db = helper.readableDatabase
+        val c = db.query("games", null, "id=?", arrayOf(id.toString()), null, null, null)
+        return c.use {
+            if (it.moveToNext()) fromCursor(it) else null
+        }
+    }
+
+    /**
+     * 一次读取指定 id 的游戏，包含隐藏游戏；缺失的 id 不会出现在结果中。
+     *
+     * 适用于展示最近游玩记录等小批量关联查询，避免逐行创建 Repository 并查询数据库。
+     */
+    fun findByIds(ids: Collection<Long>): List<Game> {
+        val distinctIds = ids.filter { it > 0L }.distinct()
+        if (distinctIds.isEmpty()) return emptyList()
+        val placeholders = distinctIds.joinToString(",") { "?" }
+        val db = helper.readableDatabase
+        val c = db.query(
+            "games",
+            null,
+            "id IN ($placeholders)",
+            distinctIds.map(Long::toString).toTypedArray(),
+            null,
+            null,
+            null
+        )
+        return c.use {
+            buildList {
+                while (it.moveToNext()) add(fromCursor(it))
+            }
+        }
+    }
+
+    /**
+     * 插入游戏记录，返回新行 id。
+     *
+     * 契约变化（相对 Java 原版）：
+     * - Java 原版：game 为 null 抛 IllegalArgumentException；rootUri 非空约束在 SQL 层。
+     * - Kotlin 版：game 参数声明为非空类型，Java 调用方传 null 将由 Kotlin 运行时抛 NPE
+     *   而非 IllegalArgumentException。
+     * 当前所有 Java 调用方（如 ImporterService）均传非空 Game，无实际触发路径。
+     */
+    fun insert(game: Game): Long {
+        val db = helper.writableDatabase
+        return insert(game, db)
+    }
+
+    /**
+     * 使用外部传入的 SQLiteDatabase 写入，确保调用方的事务边界生效。
+     * 用于跨服务事务场景（如 ImporterService.importSelected 包裹的事务），
+     * 避免新 Helper 实例拿到独立连接导致 rollback 时行残留。
+     *
+     * 契约变化（相对 Java 原版）：与 [insert] 同——game 参数声明为非空类型，
+     * Java 调用方传 null 将由 Kotlin 运行时抛 NPE 而非 IllegalArgumentException。
+     * 当前所有 Java 调用方均传非空 Game，无实际触发路径。
+     */
+    fun insert(game: Game, db: SQLiteDatabase): Long {
+        val now = System.currentTimeMillis()
+        game.createdAt = if (game.createdAt == 0L) now else game.createdAt
+        game.updatedAt = now
+        val id = db.insert("games", null, toValues(game))
+        game.id = id
+        return id
+    }
+
+    fun existsByRootUri(rootUri: String?): Boolean {
+        if (rootUri == null || rootUri.trim().isEmpty()) return false
+        val db = helper.readableDatabase
+        val key = normalizeRootUriKey(rootUri)
+        val c = db.rawQuery("SELECT 1 FROM games WHERE root_uri_key=? LIMIT 1", arrayOf(key))
+        return c.use { it.moveToFirst() }
+    }
+
+    fun getRootUriSet(): Set<String> {
+        val set = HashSet<String>()
+        val db = helper.readableDatabase
+        val c = db.rawQuery("SELECT root_uri FROM games WHERE root_uri IS NOT NULL AND root_uri != ''", null)
+        c.use {
+            while (it.moveToNext()) set.add(it.getString(0))
+        }
+        return set
+    }
+
+    fun getRootUriKeySet(): Set<String> {
+        val set = HashSet<String>()
+        val db = helper.readableDatabase
+        val c = db.rawQuery("SELECT root_uri_key FROM games WHERE root_uri_key != ''", null)
+        c.use {
+            while (it.moveToNext()) set.add(it.getString(0))
+        }
+        return set
+    }
+
+    /**
+     * 若同 root_uri_key 已存在则跳过插入（CONFLICT_IGNORE），返回新行 id 或 -1（已存在/失败）。
+     *
+     * 契约变化（相对 Java 原版）：
+     * - Java 原版：game 为 null 抛 IllegalArgumentException；rootUri 为空返回 -1。
+     * - Kotlin 版：game 参数声明为非空类型，Java 调用方传 null 将由 Kotlin 运行时抛 NPE
+     *   而非 IllegalArgumentException；rootUri 为空仍返回 -1，与原版一致。
+     * 当前所有 Java 调用方均传非空 Game，无实际触发路径。
+     */
+    fun insertIfNotExists(game: Game): Long {
+        val rootUri = game.rootUri
+        if (rootUri == null || rootUri.trim().isEmpty()) return -1
+        val db = helper.writableDatabase
+        val now = System.currentTimeMillis()
+        game.createdAt = if (game.createdAt == 0L) now else game.createdAt
+        game.updatedAt = now
+        val id = db.insertWithOnConflict("games", null, toValues(game), SQLiteDatabase.CONFLICT_IGNORE)
+        if (id > 0) game.id = id
+        // CONFLICT_IGNORE makes the scan/import identity check atomic.  Keep the
+        // established -1 "already present" contract for callers.
+        return id
+    }
+
+    /**
+     * 查找扫描结果对应的现有游戏。云端恢复后的 SAF URI 可能因重新授权或换设备而变化，
+     * 因此在完整 URI 之外，允许用同引擎下唯一的路径末段或标题进行保守匹配。
+     */
+    fun findScannedMatch(scanned: Game?): Game? {
+        if (scanned == null) return null
+        val exact = findByRootUri(scanned.rootUri)
+        if (exact != null) return exact
+
+        val games = allIncludingHidden
+        val scannedLeaf = portableRootLeaf(scanned.rootUri)
+        val leafMatch = uniqueScannedMatch(games, scanned, scannedLeaf, true)
+        if (leafMatch != null) return leafMatch
+        return uniqueScannedMatch(games, scanned, normalizeIdentityText(scanned.title), false)
+    }
+
+    /** 更新云端恢复卡片的本机扫描路径，保留游玩统计、封面和用户编辑字段。 */
+    fun bindScannedLocation(existing: Game?, scanned: Game?): Int {
+        if (existing == null || existing.id <= 0 || scanned == null) return 0
+        existing.rootUri = scanned.rootUri
+        if (scanned.engine != null && scanned.engine != EngineType.UNKNOWN) existing.engine = scanned.engine
+        val scannedLaunchTarget = scanned.launchTarget
+        if (scannedLaunchTarget != null && scannedLaunchTarget.trim().isNotEmpty()) existing.launchTarget = scannedLaunchTarget
+        val scannedEmulatorPackage = scanned.emulatorPackage
+        if (scannedEmulatorPackage != null && scannedEmulatorPackage.trim().isNotEmpty()) existing.emulatorPackage = scannedEmulatorPackage
+        return update(existing)
+    }
+
+    fun update(game: Game): Int {
+        val db = helper.writableDatabase
+        game.updatedAt = System.currentTimeMillis()
+        return db.update("games", toValues(game), "id=?", arrayOf(game.id.toString()))
+    }
+
+    fun delete(id: Long): Int {
+        val db = helper.writableDatabase
+        return db.delete("games", "id=?", arrayOf(id.toString()))
+    }
+
+    /** 删除 games 表全部记录（仅数据库记录，不删除实际文件）。返回删除行数。 */
+    fun deleteAll(): Int {
+        val db = helper.writableDatabase
+        return db.delete("games", null, null)
+    }
+
+    fun startPlaySession(gameId: Long, start: Long, launchType: String?): Long =
+        playSessions.startPlaySession(gameId, start, launchType)
+
+    fun cancelPlaySession(sessionId: Long) = playSessions.cancelPlaySession(sessionId)
+
+    /**
+     * 软删除指定的游玩会话记录。仅标记 deleted=1，不实际删除行，
+     * 保证已同步到服务端的记录在后续导出/同步时仍可识别。
+     *
+     * @return 受影响行数；0 表示会话不存在或已删除。
+     */
+    fun deletePlaySession(sessionId: Long): Int = playSessions.deletePlaySession(sessionId)
+
+    fun finishPlaySession(sessionId: Long, end: Long, minDuration: Long, maxDuration: Long) =
+        playSessions.finishPlaySession(sessionId, end, minDuration, maxDuration)
+
+    fun finishPlaySession(
+        sessionId: Long,
+        end: Long,
+        effectiveDuration: Long,
+        minDuration: Long,
+        maxDuration: Long,
+    ) = playSessions.finishPlaySession(sessionId, end, effectiveDuration, minDuration, maxDuration)
+
+    fun finishUnfinishedPlaySessions(end: Long, minDuration: Long, maxDuration: Long) {
+        playSessions.finishUnfinishedPlaySessions(end, minDuration, maxDuration)
+    }
+
+    fun finishUnfinishedPlaySessions(end: Long, minDuration: Long, maxDuration: Long, exceptSessionId: Long) {
+        playSessions.finishUnfinishedPlaySessions(end, minDuration, maxDuration, exceptSessionId)
+    }
+
+    fun findLatestOpenPlaySession(): PlaySessionRepository.PlayActivity? = playSessions.findLatestOpenPlaySession()
+
+    fun deleteOpenPlaySessions(): Int = playSessions.deleteOpenPlaySessions()
+
+    fun deleteOpenPlaySession(sessionId: Long): Int = playSessions.deleteOpenPlaySession(sessionId)
+
+    fun addPlayTime(gameId: Long, start: Long, end: Long, duration: Long) =
+        playSessions.addPlayTime(gameId, start, end, duration)
+
+    fun addManualPlayTime(gameId: Long, duration: Long) = playSessions.addManualPlayTime(gameId, duration)
+
+    fun addManualPlayTime(gameId: Long, duration: Long, end: Long) =
+        playSessions.addManualPlayTime(gameId, duration, end)
+
+    fun getPlayDurationsBetween(startInclusive: Long, endExclusive: Long): Map<String, Long> =
+        playSessions.getPlayDurationsBetween(startInclusive, endExclusive)
+
+    fun getRecentPlayActivities(limit: Int): List<PlaySessionRepository.PlayActivity> = playSessions.getRecentPlayActivities(limit)
+
+    fun getPlayActivitiesBetween(startInclusive: Long, endExclusive: Long, limit: Int): List<PlaySessionRepository.PlayActivity> =
+        playSessions.getPlayActivitiesBetween(startInclusive, endExclusive, limit)
+
+
+    @Throws(Exception::class)
+    fun exportGamesJson(): JSONArray {
+        val arr = JSONArray()
+        val db = helper.readableDatabase
+        val c = db.query("games", null, null, null, null, null, "id ASC")
+        c.use {
+            while (it.moveToNext()) {
+                val o = JSONObject()
+                val id = it.getLong(it.getColumnIndexOrThrow("id"))
+                o.put("local_id", id)
+                o.put("title", it.getString(it.getColumnIndexOrThrow("title")))
+                o.put("original_title", it.getString(it.getColumnIndexOrThrow("original_title")))
+                o.put("engine", it.getString(it.getColumnIndexOrThrow("engine")))
+                o.put("root_uri", it.getString(it.getColumnIndexOrThrow("root_uri")))
+                o.put("cover_uri", it.getString(it.getColumnIndexOrThrow("cover_uri")))
+                o.put("cover_persist_uri", getStringOrNull(it, "cover_persist_uri"))
+                o.put("cover_source_type", getIntOrDefault(it, "cover_source_type", 0))
+                o.put("emulator_package", it.getString(it.getColumnIndexOrThrow("emulator_package")))
+                o.put("launch_target", getStringOrNull(it, "launch_target"))
+                o.put("winlator_launch_mode", getStringOrNull(it, "winlator_launch_mode"))
+                o.put("description", it.getString(it.getColumnIndexOrThrow("description")))
+                o.put("tags", it.getString(it.getColumnIndexOrThrow("tags")))
+                var gamehubId = getStringOrNull(it, "gamehub_local_game_id")
+                if (gamehubId == null || gamehubId.isEmpty()) gamehubId = getStringOrNull(it, "gaishi_local_game_id")
+                o.put("gamehub_local_game_id", gamehubId)
+                o.put("gaishi_local_game_id", gamehubId)
+                o.put("gamehub_launch_mode", normalizeGameHubLaunchMode(getStringOrNull(it, "gamehub_launch_mode")))
+                o.put("play_status", normalizePlayStatus(getStringOrNull(it, "play_status")))
+                o.put("total_play_time", it.getLong(it.getColumnIndexOrThrow("total_play_time")))
+                o.put("last_played_at", it.getLong(it.getColumnIndexOrThrow("last_played_at")))
+                o.put("playtime_reset_at", getLongOrDefault(it, "playtime_reset_at", 0L))
+                o.put("created_at", it.getLong(it.getColumnIndexOrThrow("created_at")))
+                o.put("updated_at", it.getLong(it.getColumnIndexOrThrow("updated_at")))
+                o.put("hidden", it.getInt(it.getColumnIndexOrThrow("hidden")) == 1)
+                o.put("favorite", it.getInt(it.getColumnIndexOrThrow("favorite")) == 1)
+                arr.put(o)
+            }
+        }
+        return arr
+    }
+
+    @Throws(Exception::class)
+    fun exportPlaySessionsJson(): JSONArray {
+        val arr = JSONArray()
+        val db = helper.readableDatabase
+        val c = db.rawQuery("SELECT ps.*, g.root_uri, g.title AS game_title, g.engine AS game_engine, g.emulator_package AS game_emulator_package, g.gamehub_local_game_id AS gamehub_local_game_id, g.gaishi_local_game_id AS gaishi_local_game_id FROM play_sessions ps LEFT JOIN games g ON g.id=ps.game_id WHERE IFNULL(ps.deleted,0)=0 AND COALESCE(ps.end_time,ps.start_time,0)>=IFNULL(g.playtime_reset_at,0) ORDER BY ps.start_time ASC", null)
+        c.use {
+            while (it.moveToNext()) {
+                val o = JSONObject()
+                o.put("session_uuid", getStringOrNull(it, "session_uuid"))
+                o.put("game_local_id", it.getLong(it.getColumnIndexOrThrow("game_id")))
+                o.put("game_root_uri", getStringOrNull(it, "root_uri"))
+                var sessionGameHubId = getStringOrNull(it, "gamehub_local_game_id")
+                if (sessionGameHubId == null || sessionGameHubId.isEmpty()) sessionGameHubId = getStringOrNull(it, "gaishi_local_game_id")
+                o.put("gamehub_local_game_id", sessionGameHubId)
+                o.put("gaishi_local_game_id", sessionGameHubId)
+                o.put("game_title", getStringOrNull(it, "game_title"))
+                o.put("game_engine", getStringOrNull(it, "game_engine"))
+                o.put("game_emulator_package", getStringOrNull(it, "game_emulator_package"))
+                o.put("start_time", it.getLong(it.getColumnIndexOrThrow("start_time")))
+                val endIdx = it.getColumnIndex("end_time")
+                if (endIdx >= 0 && !it.isNull(endIdx)) o.put("end_time", it.getLong(endIdx))
+                o.put("duration", it.getLong(it.getColumnIndexOrThrow("duration")))
+                o.put("launch_type", getStringOrNull(it, "launch_type"))
+                o.put("device_id", getStringOrNull(it, "device_id"))
+                o.put("created_at", getLongOrDefault(it, "created_at", it.getLong(it.getColumnIndexOrThrow("start_time"))))
+                o.put("updated_at", getLongOrDefault(it, "updated_at", it.getLong(it.getColumnIndexOrThrow("start_time"))))
+                arr.put(o)
+            }
+        }
+        return arr
+    }
+
+    @Throws(Exception::class)
+    fun importGamesJson(arr: JSONArray?): Int {
+        return importGamesJson(helper.writableDatabase, arr)
+    }
+
+    @Throws(Exception::class)
+    fun importGamesJson(db: SQLiteDatabase, arr: JSONArray?): Int {
+        if (arr == null) return 0
+        var changed = 0
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            val rootUri = o.optString("root_uri", "").trim()
+            var g = findBySyncIdentity(db, o, rootUri)
+            val exists = g != null
+            if (g == null) g = Game()
+            val existingUpdatedAt = if (exists) Math.max(0L, g.updatedAt) else 0L
+            val incomingUpdatedAt = Math.max(0L, o.optLong("updated_at", existingUpdatedAt))
+            val applyDetails = !exists || incomingUpdatedAt >= existingUpdatedAt
+            if (applyDetails) {
+                g.title = o.optString("title", g.title ?: "未命名游戏")
+                g.originalTitle = o.optString("original_title", g.originalTitle)
+                g.engine = EngineType.fromString(o.optString("engine", g.engine?.name ?: EngineType.UNKNOWN.name))
+                val gRootUri = g.rootUri
+                if (rootUri.isNotEmpty() || gRootUri == null || gRootUri.trim().isEmpty()) g.rootUri = rootUri
+                g.coverUri = o.optString("cover_uri", g.coverUri)
+                g.coverPersistUri = o.optString("cover_persist_uri", g.coverPersistUri)
+                g.coverSourceType = o.optInt("cover_source_type", g.coverSourceType)
+                g.emulatorPackage = o.optString("emulator_package", g.emulatorPackage)
+                g.launchTarget = o.optString("launch_target", g.launchTarget)
+                g.winlatorLaunchMode = normalizeWinlatorLaunchMode(o.optString("winlator_launch_mode", g.winlatorLaunchMode))
+                g.description = o.optString("description", g.description)
+                g.tags = o.optString("tags", g.tags)
+                g.gamehubLocalGameId = o.optString("gamehub_local_game_id", o.optString("gaishi_local_game_id", g.gamehubLocalGameId))
+                g.gamehubLaunchMode = normalizeGameHubLaunchMode(o.optString("gamehub_launch_mode", g.gamehubLaunchMode))
+                g.playStatus = normalizePlayStatus(o.optString("play_status", g.playStatus))
+                g.hidden = o.optBoolean("hidden", g.hidden)
+                g.favorite = o.optBoolean("favorite", g.favorite)
+            } else {
+                // Older card metadata must not overwrite newer local edits, but it may
+                // still fill identity fields that are missing locally.
+                val rootUriValue = g.rootUri
+                if ((rootUriValue == null || rootUriValue.trim().isEmpty()) && rootUri.isNotEmpty()) g.rootUri = rootUri
+                val gamehubLocalGameIdValue = g.gamehubLocalGameId
+                if (gamehubLocalGameIdValue == null || gamehubLocalGameIdValue.trim().isEmpty()) {
+                    g.gamehubLocalGameId = o.optString("gamehub_local_game_id", o.optString("gaishi_local_game_id", g.gamehubLocalGameId))
+                }
+            }
+            val titleValue = g.title
+            if (titleValue == null || titleValue.trim().isEmpty()) g.title = "未命名游戏"
+            if (g.engine == null) g.engine = EngineType.UNKNOWN
+            val incomingResetAt = Math.max(0L, o.optLong("playtime_reset_at", 0L))
+            val incomingTotalPlayTime = Math.max(0L, o.optLong("total_play_time", 0L))
+            val incomingLastPlayedAt = Math.max(0L, o.optLong("last_played_at", 0L))
+            val resetAdvanced = incomingResetAt > g.playtimeResetAt
+            if (resetAdvanced) {
+                // A newer reset/manual-set on another device is an explicit operation;
+                // accept its aggregate value and discard older local sessions below.
+                g.playtimeResetAt = incomingResetAt
+                g.totalPlayTime = incomingTotalPlayTime
+                g.lastPlayedAt = incomingLastPlayedAt
+            } else if (incomingResetAt == g.playtimeResetAt) {
+                // Total play time is cumulative. During smart merge or normal download,
+                // never let an older/empty device overwrite a larger aggregate with 0.
+                g.totalPlayTime = Math.max(g.totalPlayTime, incomingTotalPlayTime)
+                g.lastPlayedAt = Math.max(g.lastPlayedAt, incomingLastPlayedAt)
+            } else {
+                // Local reset is newer. Ignore incoming aggregate to avoid resurrecting
+                // play time that was intentionally cleared locally. Newer sessions, if any,
+                // can still be imported by importPlaySessionsJson() when they pass resetAt.
+            }
+            g.createdAt = o.optLong("created_at", g.createdAt)
+            g.updatedAt = Math.max(g.updatedAt, o.optLong("updated_at", g.updatedAt))
+            if (g.createdAt <= 0) g.createdAt = System.currentTimeMillis()
+            if (g.updatedAt <= 0) g.updatedAt = g.createdAt
+            if (exists) {
+                if (db.update("games", toValues(g), "id=?", arrayOf(g.id.toString())) <= 0) {
+                    throw IllegalStateException("更新云端游戏失败: ${g.id}")
+                }
+            } else {
+                val id = db.insertWithOnConflict("games", null, toValues(g), SQLiteDatabase.CONFLICT_IGNORE)
+                if (id > 0) {
+                    g.id = id
+                } else if (rootUri.isNotEmpty()) {
+                    // Another scan/import won the same URI identity concurrently.
+                    // Reapply this already-merged snapshot to that canonical row.
+                    val concurrent = findByRootUri(db, rootUri)
+                        ?: throw IllegalStateException("并发插入后无法找到云端游戏: ${g.title}")
+                    g.id = concurrent.id
+                    if (db.update("games", toValues(g), "id=?", arrayOf(g.id.toString())) != 1) {
+                        throw IllegalStateException("并发合并云端游戏失败: ${g.title}")
+                    }
+                } else {
+                    throw IllegalStateException("插入云端游戏失败: ${g.title}")
+                }
+            }
+            if (resetAdvanced && g.id > 0) {
+                db.delete("play_sessions", "game_id=? AND (COALESCE(end_time,start_time,0) <= ?)", arrayOf(g.id.toString(), g.playtimeResetAt.toString()))
+            }
+            changed++
+        }
+        recalculatePlayStats(db)
+        return changed
+    }
+
+    @Throws(Exception::class)
+    fun importPlaySessionsJson(arr: JSONArray?): Int {
+        return importPlaySessionsJson(helper.writableDatabase, arr)
+    }
+
+    @Throws(Exception::class)
+    fun importPlaySessionsJson(db: SQLiteDatabase, arr: JSONArray?): Int {
+        if (arr == null) return 0
+        var changed = 0
+        for (i in 0 until arr.length()) {
+            val o = arr.optJSONObject(i) ?: continue
+            var uuid = o.optString("session_uuid", "").trim()
+            if (uuid.isEmpty()) uuid = UUID.randomUUID().toString()
+            val dup = db.rawQuery("SELECT id,updated_at FROM play_sessions WHERE session_uuid=? LIMIT 1", arrayOf(uuid))
+            var existingSessionId = -1L
+            var existingUpdatedAt = 0L
+            dup.use {
+                if (it.moveToFirst()) {
+                    existingSessionId = it.getLong(0)
+                    existingUpdatedAt = it.getLong(1)
+                }
+            }
+            val rootUri = o.optString("game_root_uri", "").trim()
+            var g: Game? = findByRootUri(db, rootUri)
+            if (g == null) {
+                val identity = JSONObject()
+                identity.put("root_uri", rootUri)
+                identity.put("gamehub_local_game_id", o.optString("gamehub_local_game_id", o.optString("gaishi_local_game_id", "")))
+                identity.put("gaishi_local_game_id", o.optString("gaishi_local_game_id", o.optString("gamehub_local_game_id", "")))
+                identity.put("title", o.optString("game_title", ""))
+                identity.put("engine", o.optString("game_engine", ""))
+                identity.put("emulator_package", o.optString("game_emulator_package", ""))
+                g = findBySyncIdentity(db, identity, rootUri)
+            }
+            if (g == null || g.id <= 0) continue
+            val endTime = if (o.has("end_time") && !o.isNull("end_time")) o.optLong("end_time") else 0L
+            val startTime = o.optLong("start_time", 0L)
+            val sessionTime = if (endTime > 0) endTime else startTime
+            if (g.playtimeResetAt > 0 && sessionTime > 0 && sessionTime < g.playtimeResetAt) continue
+            val incomingUpdatedAt = o.optLong("updated_at", System.currentTimeMillis())
+            if (existingSessionId > 0 && incomingUpdatedAt < existingUpdatedAt) continue
+            val v = ContentValues()
+            v.put("game_id", g.id)
+            v.put("start_time", o.optLong("start_time", 0))
+            if (o.has("end_time") && !o.isNull("end_time")) v.put("end_time", o.optLong("end_time")) else v.putNull("end_time")
+            v.put("duration", Math.max(0L, o.optLong("duration", 0)))
+            v.put("launch_type", o.optString("launch_type", "external"))
+            v.put("session_uuid", uuid)
+            v.put("device_id", o.optString("device_id", "imported"))
+            v.put("created_at", o.optLong("created_at", o.optLong("start_time", 0)))
+            v.put("updated_at", incomingUpdatedAt)
+            v.put("dirty", 1)
+            v.put("deleted", 0)
+            if (existingSessionId > 0) {
+                if (db.update("play_sessions", v, "id=?", arrayOf(existingSessionId.toString())) <= 0) {
+                    throw IllegalStateException("更新云端游玩记录失败: $uuid")
+                }
+            } else {
+                if (db.insert("play_sessions", null, v) <= 0) {
+                    throw IllegalStateException("插入云端游玩记录失败: $uuid")
+                }
+            }
+            changed++
+        }
+        recalculatePlayStats(db)
+        return changed
+    }
+
+    fun recalculatePlayStats() {
+        recalculatePlayStats(helper.writableDatabase)
+    }
+
+    private fun recalculatePlayStats(db: SQLiteDatabase) {
+        // Preserve imported/manual aggregate play time when the synced snapshot only
+        // contains a limited tail of play_sessions. Explicit clear/manual reset is
+        // represented by a newer playtime_reset_at plus the aggregate value imported
+        // in importGamesJson(), so this method must never blindly lower totals.
+        db.execSQL("UPDATE games SET total_play_time=MAX(IFNULL(total_play_time,0),IFNULL((SELECT SUM(duration) FROM play_sessions WHERE game_id=games.id AND end_time IS NOT NULL AND IFNULL(deleted,0)=0 AND end_time>=IFNULL(games.playtime_reset_at,0)),0)), last_played_at=MAX(IFNULL(last_played_at,0),IFNULL((SELECT MAX(end_time) FROM play_sessions WHERE game_id=games.id AND end_time IS NOT NULL AND IFNULL(deleted,0)=0 AND end_time>=IFNULL(games.playtime_reset_at,0)),0))")
+    }
+
+    private fun findByRootUri(rootUri: String?): Game? {
+        return findByRootUri(helper.readableDatabase, rootUri)
+    }
+
+    private fun findByRootUri(db: SQLiteDatabase, rootUri: String?): Game? {
+        if (rootUri == null || rootUri.trim().isEmpty()) return null
+        val key = normalizeRootUriKey(rootUri)
+        val c = db.query("games", null, "root_uri_key=?", arrayOf(key), null, null, null, "1")
+        return c.use {
+            if (it.moveToFirst()) fromCursor(it) else null
+        }
+    }
+
+    private val allIncludingHidden: List<Game>
+        get() {
+            val list = ArrayList<Game>()
+            val db = helper.readableDatabase
+            val c = db.query("games", null, null, null, null, null, "updated_at DESC")
+            c.use {
+                while (it.moveToNext()) list.add(fromCursor(it))
+            }
+            return list
+        }
+
+    private fun uniqueScannedMatch(games: List<Game>?, scanned: Game, key: String, byLeaf: Boolean): Game? {
+        if (games == null || key.isEmpty()) return null
+        var match: Game? = null
+        for (candidate in games) {
+            if (candidate.engine != scanned.engine) continue
+            val same: Boolean = if (byLeaf) {
+                key == portableRootLeaf(candidate.rootUri)
+            } else {
+                key == normalizeIdentityText(candidate.title) || key == normalizeIdentityText(candidate.originalTitle)
+            }
+            if (!same) continue
+            if (match != null && match.id != candidate.id) return null
+            match = candidate
+        }
+        return match
+    }
+
+    private fun findBySyncIdentity(db: SQLiteDatabase, o: JSONObject?, rootUri: String): Game? {
+        val byRoot = findByRootUri(db, rootUri)
+        if (byRoot != null) return byRoot
+        if (o == null) return null
+        val gamehubId = o.optString("gamehub_local_game_id", o.optString("gaishi_local_game_id", "")).trim()
+        if (gamehubId.isNotEmpty()) {
+            val byGameHub = findByGameHubLocalId(db, gamehubId)
+            if (byGameHub != null) return byGameHub
+        }
+        return findByTitleForEmptyRoot(db, o.optString("title", "").trim())
+    }
+
+    private fun findByGameHubLocalId(db: SQLiteDatabase, gamehubId: String?): Game? {
+        if (gamehubId == null || gamehubId.trim().isEmpty()) return null
+        val c = db.query("games", null, "gamehub_local_game_id=? OR gaishi_local_game_id=?", arrayOf(gamehubId, gamehubId), null, null, "updated_at DESC", "1")
+        return c.use {
+            if (!it.moveToFirst()) null else fromCursor(it)
+        }
+    }
+
+    private fun findByTitleForEmptyRoot(title: String): Game? {
+        return findByTitleForEmptyRoot(helper.readableDatabase, title)
+    }
+
+    private fun findByTitleForEmptyRoot(db: SQLiteDatabase, title: String?): Game? {
+        if (title == null || title.trim().isEmpty()) return null
+        val c = db.query("games", null,
+            "IFNULL(root_uri,'')='' AND IFNULL(title,'')=?",
+            arrayOf(title.trim()),
+            null, null, "updated_at DESC", "1")
+        return c.use {
+            if (!it.moveToFirst()) null else fromCursor(it)
+        }
+    }
+
+    fun isEmpty(): Boolean {
+        val db = helper.readableDatabase
+        val c = db.rawQuery("SELECT COUNT(*) FROM games", null)
+        return c.use { it.moveToFirst() && it.getInt(0) == 0 }
+    }
+
+    fun insertSamplesIfEmpty() {
+        // Production build should not auto-create placeholder games.
+    }
+
+    fun deleteSampleGames(): Int {
+        val db = helper.writableDatabase
+        return db.delete("games", "root_uri LIKE ?", arrayOf("sample://%"))
+    }
+
+    private fun toValues(g: Game): ContentValues {
+        val v = ContentValues()
+        v.put("title", nvl(g.title))
+        v.put("original_title", g.originalTitle)
+        v.put("engine", (g.engine ?: EngineType.UNKNOWN).name)
+        v.put("root_uri", nvl(g.rootUri))
+        v.put("root_uri_key", normalizeRootUriKey(g.rootUri))
+        v.put("cover_uri", g.coverUri)
+        v.put("cover_persist_uri", g.coverPersistUri)
+        v.put("cover_source_type", g.coverSourceType)
+        v.put("emulator_package", g.emulatorPackage)
+        v.put("launch_target", normalizeLaunchTarget(g.launchTarget))
+        v.put("winlator_launch_mode", normalizeWinlatorLaunchMode(g.winlatorLaunchMode))
+        v.put("description", g.description)
+        v.put("tags", g.tags)
+        v.put("gamehub_local_game_id", g.gamehubLocalGameId)
+        v.put("gaishi_local_game_id", g.gamehubLocalGameId)
+        v.put("gamehub_launch_mode", normalizeGameHubLaunchMode(g.gamehubLaunchMode))
+        v.put("play_status", normalizePlayStatus(g.playStatus))
+        v.put("total_play_time", g.totalPlayTime)
+        v.put("last_played_at", g.lastPlayedAt)
+        v.put("playtime_reset_at", g.playtimeResetAt)
+        v.put("created_at", g.createdAt)
+        v.put("updated_at", g.updatedAt)
+        v.put("hidden", if (g.hidden) 1 else 0)
+        v.put("favorite", if (g.favorite) 1 else 0)
+        v.put("password_lock", g.passwordLock)
+        return v
+    }
+
+    private fun fromCursor(c: Cursor): Game {
+        val g = Game()
+        g.id = c.getLong(c.getColumnIndexOrThrow("id"))
+        g.title = c.getString(c.getColumnIndexOrThrow("title"))
+        g.originalTitle = c.getString(c.getColumnIndexOrThrow("original_title"))
+        g.engine = EngineType.fromString(c.getString(c.getColumnIndexOrThrow("engine")))
+        g.rootUri = c.getString(c.getColumnIndexOrThrow("root_uri"))
+        g.coverUri = c.getString(c.getColumnIndexOrThrow("cover_uri"))
+        g.coverPersistUri = getStringOrNull(c, "cover_persist_uri")
+        g.coverSourceType = getIntOrDefault(c, "cover_source_type", 0)
+        g.emulatorPackage = c.getString(c.getColumnIndexOrThrow("emulator_package"))
+        g.launchTarget = normalizeLaunchTarget(getStringOrNull(c, "launch_target"))
+        g.winlatorLaunchMode = normalizeWinlatorLaunchMode(getStringOrNull(c, "winlator_launch_mode"))
+        g.description = c.getString(c.getColumnIndexOrThrow("description"))
+        g.tags = c.getString(c.getColumnIndexOrThrow("tags"))
+        g.gamehubLocalGameId = getStringOrNull(c, "gamehub_local_game_id")
+        if (g.gamehubLocalGameId.isNullOrEmpty()) g.gamehubLocalGameId = getStringOrNull(c, "gaishi_local_game_id")
+        g.gamehubLaunchMode = normalizeGameHubLaunchMode(getStringOrNull(c, "gamehub_launch_mode"))
+        g.playStatus = normalizePlayStatus(getStringOrNull(c, "play_status"))
+        g.totalPlayTime = c.getLong(c.getColumnIndexOrThrow("total_play_time"))
+        g.lastPlayedAt = c.getLong(c.getColumnIndexOrThrow("last_played_at"))
+        g.playtimeResetAt = getLongOrDefault(c, "playtime_reset_at", 0L)
+        g.createdAt = c.getLong(c.getColumnIndexOrThrow("created_at"))
+        g.updatedAt = c.getLong(c.getColumnIndexOrThrow("updated_at"))
+        g.hidden = c.getInt(c.getColumnIndexOrThrow("hidden")) == 1
+        val favoriteIndex = c.getColumnIndex("favorite")
+        g.favorite = favoriteIndex >= 0 && !c.isNull(favoriteIndex) && c.getInt(favoriteIndex) == 1
+        g.passwordLock = getStringOrNull(c, "password_lock")
+        return g
+    }
+
+    /**
+     * launch_target is persisted protocol data. A previous localization pass briefly wrote the
+     * translated directory label into this column, so normalize those values on every read/write.
+     */
+    private fun normalizeLaunchTarget(target: String?): String {
+        val value = target?.trim().orEmpty()
+        if (value.isEmpty()
+            || value.equals("DIR", ignoreCase = true)
+            || value == "[游戏目录]"
+            || value == "[Game folder]"
+            || value == "[Game directory]"
+            || value == "[ゲームフォルダー]"
+            || value == "[ゲームディレクトリ]"
+        ) {
+            return "[游戏目录]"
+        }
+        return target ?: "[游戏目录]"
+    }
+
+    private fun getStringOrNull(c: Cursor, column: String): String? {
+        val index = c.getColumnIndex(column)
+        return if (index >= 0) c.getString(index) else null
+    }
+
+    private fun getIntOrDefault(c: Cursor, column: String, def: Int): Int {
+        val index = c.getColumnIndex(column)
+        return if (index >= 0 && !c.isNull(index)) c.getInt(index) else def
+    }
+
+    private fun getLongOrDefault(c: Cursor, column: String, def: Long): Long {
+        val index = c.getColumnIndex(column)
+        return if (index >= 0 && !c.isNull(index)) c.getLong(index) else def
+    }
+
+    private fun normalizeWinlatorLaunchMode(mode: String?): String {
+        if (mode == null) return "game"
+        // 注意：迁移至 Kotlin 时由 toLowerCase()（默认 Locale）改为 lowercase(Locale.ROOT)，
+        // 修正土耳其 Locale 下 "I" → "ı" 的归一化缺陷（行为变化，等同 bug 修复）。
+        val s = mode.trim().lowercase(Locale.ROOT)
+        if (s == "program" || s == "normal") return "program"
+        // 兼容旧数据：root/shizuku 曾表示强制直启游戏，现在统一迁移为 game。
+        if (s == "root" || s == "shizuku" || s == "game") return "game"
+        return "game"
+    }
+
+    private fun normalizeGameHubLaunchMode(mode: String?): String {
+        if (mode == null) return "game"
+        // 注意：迁移至 Kotlin 时由 toLowerCase()（默认 Locale）改为 lowercase(Locale.ROOT)，
+        // 修正土耳其 Locale 下 "I" → "ı" 的归一化缺陷（行为变化，等同 bug 修复）。
+        val s = mode.trim().lowercase(Locale.ROOT)
+        if (s == "program" || s == "normal") return "program"
+        return "game"
+    }
+
+    private fun nvl(value: String?): String {
+        return value ?: ""
+    }
+
+    companion object {
+        @JvmStatic
+        fun normalizeRootUriKey(value: String?): String {
+            if (value == null) return ""
+            var s = value.trim()
+            if (s.startsWith("file://")) s = s.substring("file://".length)
+            try {
+                if (s.startsWith("content://")) {
+                    val uri = android.net.Uri.parse(s)
+                    var docId: String? = null
+                    val encodedPath = uri.encodedPath
+                    val documentMarker = encodedPath?.indexOf("/document/")
+                    if (documentMarker != null && documentMarker >= 0) {
+                        // tree-document 混合 URI（tree/<treeId>/document/<docId>）：getDocumentId 只接受
+                        // 纯 document 形式，混合形式抛异常会回退 tree 根，使同库下多游戏身份 key 坍缩
+                        //（与 ScriptEngineLaunchers.uriToFilePath 同类缺陷，同思路修复）。
+                        docId = try {
+                            android.net.Uri.decode(encodedPath.substring(documentMarker + "/document/".length))
+                        } catch (_: IllegalArgumentException) { null }
+                    }
+                    if (docId == null || docId.isEmpty()) {
+                        try { docId = android.provider.DocumentsContract.getTreeDocumentId(uri) } catch (_: IllegalArgumentException) {
+                            // 非 tree URI 时无法提取 docId，忽略
+                        }
+                    }
+                    if (docId != null && docId.isNotEmpty()) s = android.net.Uri.decode(docId)
+                }
+            } catch (_: IllegalArgumentException) {
+                // URI 解析失败时保留原始字符串
+            }
+            while (s.contains("//")) s = s.replace("//", "/")
+            while (s.endsWith("/") && s.length > 1) s = s.substring(0, s.length - 1)
+            return s.lowercase(Locale.ROOT)
+        }
+
+        private fun portableRootLeaf(value: String?): String {
+            val key = normalizeRootUriKey(value)
+            if (key.isEmpty()) return ""
+            val slash = key.lastIndexOf('/')
+            var leaf = if (slash >= 0) key.substring(slash + 1) else key
+            val colon = leaf.lastIndexOf(':')
+            if (colon >= 0 && colon < leaf.length - 1) leaf = leaf.substring(colon + 1)
+            return normalizeIdentityText(leaf)
+        }
+
+        private fun normalizeIdentityText(value: String?): String {
+            if (value == null) return ""
+            return value.trim().replace("\\s+".toRegex(), " ").lowercase(Locale.ROOT)
+        }
+    }
+}

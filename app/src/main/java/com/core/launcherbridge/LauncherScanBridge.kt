@@ -1,0 +1,463 @@
+package com.core.launcherbridge
+
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.net.Uri
+import android.provider.DocumentsContract
+import androidx.documentfile.provider.DocumentFile
+import com.core.data.GameRepository
+import com.core.launcher.EnginePackages
+import com.core.model.EngineType
+import com.core.model.Game
+import com.core.util.BoundedInputStream
+import com.core.util.MAX_BITMAP_SOURCE_BYTES
+import com.core.scanner.EngineDetector
+import com.core.scanner.GameScanner
+import com.core.scanner.ScanReport
+import com.core.scanner.ScanRequest
+import com.core.scanner.ScanResult
+import com.core.util.DevLogger
+import java.io.File
+import java.io.FileOutputStream
+import java.io.IOException
+import java.io.InputStream
+import java.util.Locale
+
+/**
+ * 扫描桥接：引擎检测、目录扫描、游戏导入。
+ */
+object LauncherScanBridge {
+
+    private const val TAG = "LauncherScanBridge"
+
+    /** 扫描深度常量：扫描所有层级。对应 GameScanner.SCAN_ALL_LEVELS。 */
+    const val SCAN_ALL_LEVELS = -1
+
+    /** 扫描深度常量：扫描直到首次游戏匹配。对应 GameScanner.SCAN_UNTIL_GAME_MATCH。 */
+    const val SCAN_UNTIL_GAME_MATCH = -2
+
+    /**
+     * 通过探测目录文件特征来检测游戏引擎。
+     * 失败时返回 UNKNOWN 引擎和 0 置信度的 DetectionResult。
+     */
+    @JvmStatic
+    fun detectEngine(dir: DocumentFile?, featureDepth: Int): DetectionResult {
+        val out = DetectionResult()
+        if (dir == null) return out
+        try {
+            val source = EngineDetector.detect(dir, featureDepth) ?: return out
+            out.engine = source.engine ?: EngineType.UNKNOWN
+            out.confidence = source.confidence
+            out.launchTarget = source.launchTarget ?: ""
+            out.rpgMakerSubtype = source.rpgMakerSubtype ?: ""
+            out.renpySubtype = source.renpySubtype ?: ""
+            out.godotSubtype = source.godotSubtype ?: ""
+        } catch (_: Exception) {
+            // 引擎探测失败忽略
+        }
+        return out
+    }
+
+    /** 等价于 EngineDetector.Result 的值类，无需导入 scanner 层。 */
+    class DetectionResult {
+        @JvmField var engine: EngineType = EngineType.UNKNOWN
+        @JvmField var confidence: Int = 0
+        @JvmField var launchTarget: String = ""
+
+        /**
+         * 仅当 engine == RPGMAKER 时有意义。取值：
+         * "rpgmxp" / "rpgmvx" / "rpgmvxace" / "mkxp-z"。空串表示需用户自行决定。
+         */
+        @JvmField var rpgMakerSubtype: String = ""
+
+        /**
+         * 仅当 engine == RENPY 时有意义。取值："renpy" 或 "renpy8"。
+         */
+        @JvmField var renpySubtype: String = ""
+
+        /**
+         * 仅当 engine == GODOT 时有意义。取值："godot4"。
+         */
+        @JvmField var godotSubtype: String = ""
+    }
+
+    @JvmStatic
+    fun scanAndImport(context: Context?, roots: List<String>?, depth: Int): ImportStats =
+        scanAndImport(context, roots, ScanRequest.defaults(depth)).importStats
+
+    /** 受控变体；调用方可在导入前后检查部分发现结果。 */
+    @JvmStatic
+    fun scanAndImport(context: Context?, roots: List<String>?, request: ScanRequest?): ScanAndImportResult {
+        val scan = scanWithReport(context, roots, request)
+        val stats = ImportStats()
+        stats.scanStopReason = scan.stopReason
+        stats.partialDiscovery = scan.isPartial
+        for (error in scan.errors) {
+            stats.failed++
+            stats.failedItems.add(error)
+        }
+        // 部分发现结果绝不能被静默持久化。UI 调用方必须明确确认
+        // 返回的 ScanBatchResult，然后调用 importScanResults(results)。
+        if (scan.isPartial) {
+            stats.failed++
+            stats.failedItems.add("扫描未完整结束，未自动导入；请确认后导入已发现结果。")
+            return ScanAndImportResult(scan, stats)
+        }
+        if (context != null) importScannedGames(context.applicationContext, GameRepository(context.applicationContext), scan.results, stats)
+        return ScanAndImportResult(scan, stats)
+    }
+
+    /** 仅执行发现。调用方可在导入前解析 [ScanResult.xp3Candidates]。 */
+    @JvmStatic
+    fun scan(context: Context?, roots: List<String>?, depth: Int): List<ScanResult> =
+        scanWithReport(context, roots, ScanRequest.defaults(depth)).results
+
+    /**
+     * 跨多个根目录执行有界发现。当后续根目录失败或请求被停止时，
+     * 已完成的根目录结果被保留，允许调用方提供部分导入。
+     */
+    @JvmStatic
+    fun scanWithReport(context: Context?, roots: List<String>?, request: ScanRequest?): ScanBatchResult {
+        val batch = ScanBatchResult()
+        if (context == null || roots.isNullOrEmpty()) return batch
+        val appContext = context.applicationContext
+        val safeRequest = request ?: ScanRequest.defaults(2)
+        // A request may wait behind other single-queue work before discovery starts. Do not
+        // count that queueing time as a stalled storage scan.
+        safeRequest.markProgress()
+        val initialVisitedNodes = safeRequest.visitedNodes
+        for (root in roots) {
+            if (root.isBlank()) continue
+            if (safeRequest.isCancelled) {
+                batch.stopReason = ScanReport.StopReason.CANCELLED
+                break
+            }
+            if (safeRequest.isDeadlineReached) {
+                batch.stopReason = ScanReport.StopReason.DEADLINE
+                break
+            }
+            if (safeRequest.isNodeLimitReached) {
+                batch.stopReason = ScanReport.StopReason.NODE_LIMIT
+                break
+            }
+            try {
+                val report = GameScanner.scan(appContext, Uri.parse(root), safeRequest)
+                batch.resultsInternal.addAll(report.results)
+                batch.errorsInternal.addAll(report.errors)
+                val reason = report.stopReason
+                // 无效的 SAF 根目录仅影响该根目录。继续扫描其他已配置的根目录；
+                // 取消和共享资源限制则停止整个批次。
+                if (reason.stopsBatch()) {
+                    batch.stopReason = report.stopReason
+                    break
+                }
+            } catch (se: SecurityException) {
+                DevLogger.w(TAG, "扫描目录权限异常 root=$root: ${se.message}")
+                batch.errorsInternal.add("目录权限已失效，请重新添加：${simplifyUri(root)}")
+            } catch (e: Exception) {
+                DevLogger.w(TAG, "扫描目录失败 root=$root: ${e.message}", e)
+                batch.errorsInternal.add("扫描目录失败：${simplifyUri(root)}")
+            }
+        }
+        batch.visitedNodes = maxOf(0, safeRequest.visitedNodes - initialVisitedNodes)
+        return batch
+    }
+
+    /** 在任何交互式启动目标选择完成后导入结果。 */
+    @JvmStatic
+    fun importScanResults(context: Context?, results: List<ScanResult>?): ImportStats {
+        val stats = ImportStats()
+        if (context == null) return stats
+        importScannedGames(context.applicationContext, GameRepository(context.applicationContext), results, stats)
+        return stats
+    }
+
+    private fun simplifyUri(uri: String?): String {
+        if (uri == null) return ""
+        return try {
+            val parsed = Uri.parse(uri)
+            parsed.lastPathSegment ?: uri
+        } catch (_: IllegalArgumentException) {
+            // Uri 解析失败回退原始字符串
+            uri
+        }
+    }
+
+    private fun importScannedGames(context: Context, repository: GameRepository?, results: List<ScanResult>?, stats: ImportStats) {
+        stats.scanned = results?.size ?: 0
+        if (repository == null || results.isNullOrEmpty()) return
+        val existing = repository.getRootUriKeySet().toMutableSet()
+        for (result in results) {
+            if (result.uri.isNullOrBlank()) {
+                stats.failed++
+                stats.failedItems.add("无法读取路径的扫描结果")
+                continue
+            }
+            val rootKey = GameRepository.normalizeRootUriKey(result.uri)
+            if (existing.contains(rootKey)) {
+                stats.skipped++
+                stats.skippedItems.add(emptyText(result.title, result.uri))
+                continue
+            }
+            val game = Game()
+            game.title = result.title
+            game.rootUri = result.uri
+            game.engine = result.engine
+            game.launchTarget = if (result.launchTarget.isNullOrBlank())
+                defaultLaunchTargetForEngine(result.engine)
+            else
+                result.launchTarget
+            game.emulatorPackage = emulatorPackageForResult(context, result)
+            val restored = repository.findScannedMatch(game)
+            if (restored != null) {
+                if (rootKey != GameRepository.normalizeRootUriKey(restored.rootUri)) {
+                    repository.bindScannedLocation(restored, game)
+                }
+                existing.add(rootKey)
+                stats.skipped++
+                stats.skippedItems.add(emptyText(result.title, result.uri))
+                continue
+            }
+            val id = repository.insertIfNotExists(game)
+            if (id > 0) {
+                existing.add(rootKey)
+                stats.added++
+                stats.addedItems.add(emptyText(result.title, result.uri))
+                game.id = id
+                val cover = resolveLocalCover(context, result)
+                if (cover != null) {
+                    game.coverUri = cover
+                    game.coverPersistUri = cover
+                    game.coverSourceType = 1
+                    try { repository.update(game) } catch (_: Exception) {
+                        // 封面元数据更新失败忽略，不影响导入
+                    }
+                } else {
+                    LauncherCoverBridge.fetchCoverForGameAsync(context, game)
+                }
+            } else {
+                stats.failed++
+                stats.failedItems.add(emptyText(result.title, result.uri))
+            }
+        }
+    }
+
+    private fun resolveLocalCover(context: Context, result: ScanResult): String? {
+        if (!result.coverUri.isNullOrBlank()) {
+            val cover = copyCoverToInternalStorage(context, result.coverUri)
+            if (cover != null) return cover
+        }
+        val dirImage = findFirstImageInDir(context, result.uri)
+        if (dirImage != null) {
+            return copyCoverToInternalStorage(context, dirImage)
+        }
+        return null
+    }
+
+    private fun findFirstImageInDir(context: Context, dirUri: String?): String? {
+        if (dirUri.isNullOrBlank()) return null
+        try {
+            val tree = Uri.parse(dirUri)
+            val parentId = DocumentsContract.getTreeDocumentId(tree)
+            val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(tree, parentId)
+            context.contentResolver.query(
+                childrenUri,
+                arrayOf(DocumentsContract.Document.COLUMN_DOCUMENT_ID, DocumentsContract.Document.COLUMN_MIME_TYPE),
+                null, null, null
+            )?.use { cursor ->
+                while (cursor.moveToNext()) {
+                    val mime = cursor.getString(1)
+                    if (mime != null && mime.startsWith("image/")) {
+                        val docId = cursor.getString(0)
+                        return DocumentsContract.buildDocumentUriUsingTree(tree, docId).toString()
+                    }
+                }
+            }
+        } catch (_: IllegalArgumentException) {
+            // SAF tree document id 非法时忽略（单文件失败隔离）
+        } catch (_: SecurityException) {
+            // SAF 封面目录查询权限失效时忽略（单文件失败隔离）
+        }
+        return null
+    }
+
+    @JvmStatic
+    fun copyCoverToInternalStorage(context: Context, sourceUriStr: String?): String? {
+        if (sourceUriStr.isNullOrBlank()) return null
+        var inputStream: InputStream? = null
+        try {
+            val source = Uri.parse(sourceUriStr)
+            inputStream = BoundedInputStream(context.contentResolver.openInputStream(source) ?: return null, MAX_BITMAP_SOURCE_BYTES)
+            val opts = BitmapFactory.Options()
+            opts.inJustDecodeBounds = true
+            BitmapFactory.decodeStream(inputStream, null, opts)
+            inputStream.close()
+            inputStream = BoundedInputStream(context.contentResolver.openInputStream(source) ?: return null, MAX_BITMAP_SOURCE_BYTES)
+            val maxDim = maxOf(opts.outWidth, opts.outHeight)
+            var sampleSize = 1
+            while (maxDim / sampleSize > 1440) sampleSize *= 2
+            val decodeOpts = BitmapFactory.Options()
+            decodeOpts.inSampleSize = sampleSize
+            var bitmap = BitmapFactory.decodeStream(inputStream, null, decodeOpts)
+            inputStream.close()
+            inputStream = null
+            if (bitmap == null) return null
+            val maxPx = 720
+            val scale = minOf(1f, maxPx.toFloat() / maxOf(bitmap.width, bitmap.height))
+            if (scale < 1f) {
+                val nw = Math.round(bitmap.width * scale)
+                val nh = Math.round(bitmap.height * scale)
+                val scaled = Bitmap.createScaledBitmap(bitmap, nw, nh, true)
+                bitmap.recycle()
+                bitmap = scaled
+            }
+            val dir = File(context.filesDir, "covers")
+            if (!dir.exists()) dir.mkdirs()
+            val out = File(dir, "cover_${System.currentTimeMillis()}.jpg")
+            FileOutputStream(out).use { fos ->
+                bitmap.compress(Bitmap.CompressFormat.JPEG, 88, fos)
+            }
+            bitmap.recycle()
+            return Uri.fromFile(out).toString()
+        } catch (_: IOException) {
+            // 封面复制失败（IO 异常）返回 null，由调用方回退
+            return null
+        } catch (_: SecurityException) {
+            // SAF 授权失效（openInputStream/decode 抛 SecurityException）时返回 null，由调用方回退
+            return null
+        } finally {
+            inputStream?.let { try { it.close() } catch (_: IOException) { /* 关闭失败忽略 */ } }
+        }
+    }
+
+    private fun emulatorPackageForEngine(engine: EngineType?, context: Context?): String = when (engine) {
+        EngineType.KIRIKIRI -> EnginePackages.INTERNAL_KRKR
+        EngineType.ONS -> EnginePackages.INTERNAL_ONS
+        EngineType.TYRANO -> EnginePackages.INTERNAL_TYRANO
+        EngineType.RPG_MV -> EnginePackages.INTERNAL_TYRANO_RPG_MV
+        EngineType.RPG_MZ -> EnginePackages.INTERNAL_TYRANO_RPG_MZ
+        EngineType.ARTEMIS -> EnginePackages.INTERNAL_ARTEMIS
+        EngineType.PSP -> EnginePackages.EXTERNAL_PPSSPP
+        EngineType.NINTENDO_3DS -> EnginePackages.EXTERNAL_AZAHAR
+        EngineType.NINTENDO_SWITCH -> EnginePackages.EXTERNAL_EDEN
+        EngineType.ARMSX3 -> EnginePackages.EXTERNAL_ARMSX3
+        // 没有子类型的旧版/未来扫描结果保留保守的 RPG XP 回退。
+        EngineType.RPGMAKER -> EnginePackages.INTERNAL_RPGMAKER_XP
+        EngineType.RENPY -> EnginePackages.INTERNAL_RENPY
+        EngineType.GODOT -> EnginePackages.INTERNAL_GODOT
+        // Winlator 包名因改版众多（com.winlator / com.winlator.cmod / glibc / proot 等），
+        // 扫描阶段无法静态确定，需要探测设备上已安装的可启动 Winlator 系应用。
+        EngineType.WINLATOR -> guessInstalledWinlatorPackage(context)
+        else -> ""
+    }
+
+    /**
+     * 探测设备上已安装的 Winlator 系应用包名。
+     *
+     * 匹配规则与主分支 MainActivity.guessInstalledWinlatorPackage 一致，
+     * 关键词集合统一收敛于 [com.core.launcher.EnginePackages.WINLATOR_PACKAGE_KEYWORDS]（I-1 单源）：
+     * 包名或应用名包含 winlator / glibc / proot / mobox / winalator，且存在 Launcher Intent。
+     * 优先返回包名含 "cmod" 的改版；其次返回首个命中项；未命中返回空串。
+     */
+    private fun guessInstalledWinlatorPackage(context: Context?): String {
+        if (context == null) return ""
+        return try {
+            val pm = context.packageManager
+            // 仅需 packageName/label/LaunchIntent，不需要 meta-data，避免全量反序列化 Bundle 的开销。
+            val apps = pm.getInstalledApplications(0)
+            var fallback = ""
+            for (app in apps) {
+                if (app == null || app.packageName == null) continue
+                val pkg = app.packageName.lowercase(Locale.ROOT)
+                val label = try {
+                    pm.getApplicationLabel(app).toString().lowercase(Locale.ROOT)
+                } catch (_: RuntimeException) {
+                    // 个别应用标签解析失败忽略，回退空串
+                    ""
+                }
+                // 关键词集合统一收敛于 EnginePackages.WINLATOR_PACKAGE_KEYWORDS（I-1 单源，见 4.4）。
+                val hit = EnginePackages.WINLATOR_PACKAGE_KEYWORDS.any { keyword ->
+                    pkg.contains(keyword) || label.contains(keyword)
+                }
+                if (!hit) continue
+                if (pm.getLaunchIntentForPackage(app.packageName) == null) continue
+                if (pkg.contains("cmod")) return app.packageName
+                if (fallback.isEmpty()) fallback = app.packageName
+            }
+            fallback
+        } catch (_: Exception) {
+            // 应用枚举失败返回空串，回退默认处理
+            ""
+        }
+    }
+
+    @JvmStatic
+    fun emulatorPackageForResult(result: ScanResult?): String =
+        emulatorPackageForResult(null, result)
+
+    @JvmStatic
+    fun emulatorPackageForResult(context: Context?, result: ScanResult?): String {
+        if (result == null) return ""
+        if (result.engine == EngineType.RPGMAKER) {
+            val subtype = normalizeSubtype(result.rpgMakerSubtype)
+            if (subtype == "rpgmxp" || subtype == "rpgmvx"
+                || subtype == "rpgmvxace" || subtype == "mkxp-z"
+            ) {
+                return "internal.$subtype"
+            }
+        } else if (result.engine == EngineType.RENPY) {
+            val subtype = normalizeSubtype(result.renpySubtype)
+            if (subtype == "renpy" || subtype == "renpy8") {
+                return "internal.$subtype"
+            }
+        } else if (result.engine == EngineType.GODOT) {
+            val subtype = normalizeSubtype(result.godotSubtype)
+            if (subtype == "godot" || subtype == "godot4") {
+                return "internal.$subtype"
+            }
+        }
+        return emulatorPackageForEngine(result.engine, context)
+    }
+
+    private fun normalizeSubtype(subtype: String?): String =
+        subtype?.trim()?.lowercase(Locale.ROOT) ?: ""
+
+    private fun defaultLaunchTargetForEngine(engine: EngineType?): String = "[游戏目录]"
+
+    private fun emptyText(value: String?, fallback: String?): String =
+        if (value.isNullOrBlank()) fallback ?: "" else value.trim()
+
+    class ImportStats {
+        @JvmField var scanned: Int = 0
+        @JvmField var added: Int = 0
+        @JvmField var skipped: Int = 0
+        @JvmField var failed: Int = 0
+        @JvmField val addedItems: MutableList<String> = ArrayList()
+        @JvmField val skippedItems: MutableList<String> = ArrayList()
+        @JvmField val failedItems: MutableList<String> = ArrayList()
+
+        /** 旧版 scanAndImport 调用方的诊断信息。 */
+        @JvmField var scanStopReason: ScanReport.StopReason = ScanReport.StopReason.COMPLETED
+        @JvmField var partialDiscovery: Boolean = false
+    }
+
+    /** 多根目录扫描的聚合结果。即使部分完成也可导入结果。 */
+    class ScanBatchResult {
+        internal val resultsInternal: MutableList<ScanResult> = ArrayList()
+        internal val errorsInternal: MutableList<String> = ArrayList()
+        internal var visitedNodes: Int = 0
+        internal var stopReason: ScanReport.StopReason = ScanReport.StopReason.COMPLETED
+
+        val results: List<ScanResult> get() = ArrayList(resultsInternal)
+        val errors: List<String> get() = ArrayList(errorsInternal)
+        fun getVisitedNodes(): Int = visitedNodes
+        fun getStopReason(): ScanReport.StopReason = stopReason
+        val isPartial: Boolean get() = stopReason != ScanReport.StopReason.COMPLETED
+    }
+
+    class ScanAndImportResult(
+        @JvmField val scan: ScanBatchResult,
+        @JvmField val importStats: ImportStats
+    )
+}

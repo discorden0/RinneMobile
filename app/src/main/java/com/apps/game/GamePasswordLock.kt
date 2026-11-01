@@ -1,0 +1,105 @@
+package com.apps.game
+
+import android.content.Context
+import android.util.Log
+import android.widget.Toast
+import androidx.fragment.app.Fragment
+import com.core.R
+import com.core.launcherbridge.LauncherRepositoryBridge
+import com.core.model.Game
+import com.core.util.AppExecutors
+import com.core.util.RxMainScheduler
+
+/**
+ * 游戏密码锁定工具类。
+ * 提供设置/取消/验证密码的统一入口，供游戏库相关 Fragment 共用。
+ */
+object GamePasswordLock {
+
+    /** 检查游戏是否已设置密码 */
+    @JvmStatic
+    fun hasPassword(game: Game?): Boolean {
+        val lock = game?.passwordLock
+        return lock != null && lock.trim { it <= ' ' }.isNotEmpty()
+    }
+
+    /** 设置密码：弹出九宫格 → 两次确认 → 保存到 DB */
+    @JvmStatic
+    fun setPassword(fragment: Fragment?, game: Game?, onDone: Runnable?) {
+        if (fragment == null || game == null || !fragment.isAdded) return
+        val title = safeTitle(fragment.requireContext(), game)
+        GamePasswordDialog.showSetDialog(fragment.requireContext(), title) { hashedPassword ->
+            savePasswordToDb(fragment, game, hashedPassword, R.string.game_password_set_success, onDone)
+        }
+    }
+
+    /** 取消密码：验证当前密码后清除 */
+    @JvmStatic
+    fun clearPassword(fragment: Fragment?, game: Game?, onDone: Runnable?) {
+        if (fragment == null || game == null || !fragment.isAdded) return
+        val title = safeTitle(fragment.requireContext(), game)
+        GamePasswordDialog.showVerifyDialog(fragment.requireContext(), title, game.passwordLock) {
+            savePasswordToDb(fragment, game, null, R.string.game_password_removed, onDone)
+        }
+    }
+
+    /**
+     * 启动前密码验证拦截。
+     * 有密码 → 弹验证框 → 验证成功 → onLaunch.run()
+     * 无密码 → 直接 onLaunch.run()
+     */
+    @JvmStatic
+    fun interceptLaunch(fragment: Fragment?, game: Game?, onLaunch: Runnable?) {
+        if (fragment == null || game == null || !fragment.isAdded) return
+        if (hasPassword(game)) {
+            GamePasswordDialog.showVerifyDialog(
+                fragment.requireContext(), safeTitle(fragment.requireContext(), game),
+                game.passwordLock, onLaunch
+            )
+        } else {
+            onLaunch?.run()
+        }
+    }
+
+    private fun savePasswordToDb(
+        fragment: Fragment, game: Game, hashedPassword: String?,
+        toastMessageRes: Int, onDone: Runnable?
+    ) {
+        val app: Context = fragment.requireContext().applicationContext
+        // 用户确认后的持久化任务由应用级执行器承载，不随 Fragment View 销毁而取消。
+        AppExecutors.runOnSingle {
+            val success = try {
+                val latest = LauncherRepositoryBridge.findGameById(app, game.id)
+                if (latest == null) {
+                    false
+                } else {
+                    latest.passwordLock = hashedPassword
+                    LauncherRepositoryBridge.updateGame(app, latest) > 0
+                }
+            } catch (e: Exception) {
+                Log.w("GamePasswordLock", "Failed to save password", e)
+                false
+            }
+            RxMainScheduler.post {
+                if (!fragment.isAdded || fragment.view == null) return@post
+                // 页面已销毁时只保留落库结果，新页面会从数据库重新加载。
+                if (success) {
+                    game.passwordLock = hashedPassword
+                    Toast.makeText(fragment.requireContext(), toastMessageRes, Toast.LENGTH_SHORT).show()
+                    onDone?.run()
+                } else {
+                    Toast.makeText(
+                        fragment.requireContext(), R.string.game_password_save_failed, Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+        }
+    }
+
+    private fun safeTitle(context: Context, game: Game): String {
+        val title = game.title
+        return if (title == null || title.trim { it <= ' ' }.isEmpty())
+            context.getString(R.string.game_unnamed)
+        else title.trim { it <= ' ' }
+    }
+}

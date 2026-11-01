@@ -1,0 +1,129 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent">
+
+    <LinearLayout
+        android:id="@+id/libraryContent"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:clipToPadding="false"
+        android:orientation="vertical"
+        android:paddingStart="@dimen/launcher_library_content_horizontal_padding"
+        android:paddingTop="@dimen/launcher_library_content_top_padding"
+        android:paddingEnd="@dimen/launcher_library_content_horizontal_padding"
+        android:paddingBottom="@dimen/launcher_library_content_bottom_padding">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="@dimen/launcher_library_toolbar_height"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:id="@+id/libraryTitle"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/game_library_title"
+                android:textColor="@color/launcher_text_color"
+                android:textSize="@dimen/launcher_library_title_text_size"
+                android:textStyle="bold" />
+
+            <ImageView
+                android:id="@+id/librarySyncButton"
+                android:layout_width="@dimen/launcher_library_toolbar_button_width"
+                android:layout_height="@dimen/launcher_library_toolbar_button_height"
+                android:layout_marginEnd="@dimen/launcher_library_sync_button_margin_end"
+                android:contentDescription="@string/game_library_sync"
+                android:scaleType="centerInside"
+                android:src="@drawable/launcher_library_action_sync" />
+
+            <ImageView
+                android:id="@+id/libraryCollapseButton"
+                android:layout_width="@dimen/launcher_library_toolbar_button_width"
+                android:layout_height="@dimen/launcher_library_toolbar_button_height"
+                android:layout_marginEnd="@dimen/launcher_library_collapse_button_margin_end"
+                android:contentDescription="@string/game_library_category"
+                android:scaleType="centerInside"
+                android:src="@drawable/launcher_library_action_category" />
+
+            <ImageView
+                android:id="@+id/librarySearchButton"
+                android:layout_width="@dimen/launcher_library_toolbar_button_width"
+                android:layout_height="@dimen/launcher_library_toolbar_button_height"
+                android:contentDescription="@string/game_common_search"
+                android:scaleType="centerInside"
+                android:src="@drawable/launcher_library_action_search" />
+        </LinearLayout>
+
+        <com.apps.widget.LauncherEditText
+            android:id="@+id/librarySearchInput"
+            android:layout_width="match_parent"
+            android:layout_height="@dimen/launcher_library_search_height"
+            android:layout_marginTop="@dimen/launcher_library_search_margin_top"
+            android:background="@drawable/launcher_white_card"
+            android:hint="@string/game_name_hint"
+            android:imeOptions="actionSearch"
+            android:inputType="text"
+            android:maxLines="1"
+            android:paddingStart="@dimen/launcher_library_search_horizontal_padding"
+            android:paddingEnd="@dimen/launcher_library_search_horizontal_padding"
+            android:textColor="@color/launcher_text_color"
+            android:textColorHint="@color/launcher_text_muted_color"
+            android:textSize="@dimen/launcher_library_search_text_size"
+            android:visibility="gone" />
+
+        <HorizontalScrollView
+            android:id="@+id/libraryCategoryScroll"
+            android:layout_width="match_parent"
+            android:layout_height="@dimen/launcher_library_category_scroll_height"
+            android:layout_marginTop="@dimen/launcher_library_category_margin_top"
+            android:fillViewport="false"
+            android:overScrollMode="never"
+            android:scrollbars="none"
+            android:visibility="gone">
+
+            <LinearLayout
+                android:id="@+id/libraryCategoryRow"
+                android:layout_width="wrap_content"
+                android:layout_height="match_parent"
+                android:gravity="center_vertical"
+                android:orientation="horizontal" />
+        </HorizontalScrollView>
+
+        <FrameLayout
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_marginTop="@dimen/launcher_library_list_margin_top"
+            android:layout_weight="1">
+
+            <!-- 与首页 recentRefresh 相同的下拉刷新模式：仅包裹列表，空态文案保持兄弟节点。 -->
+            <androidx.swiperefreshlayout.widget.SwipeRefreshLayout
+                android:id="@+id/libraryRefresh"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent">
+
+                <androidx.recyclerview.widget.RecyclerView
+                    android:id="@+id/libraryRecycler"
+                    android:layout_width="match_parent"
+                    android:layout_height="match_parent"
+                    android:clipToPadding="false"
+                    android:paddingBottom="@dimen/launcher_library_recycler_bottom_padding"
+                    android:scrollbars="none"
+                    android:visibility="gone" />
+            </androidx.swiperefreshlayout.widget.SwipeRefreshLayout>
+
+            <TextView
+                android:id="@+id/libraryEmpty"
+                android:layout_width="match_parent"
+                android:layout_height="@dimen/launcher_library_empty_height"
+                android:layout_gravity="center"
+                android:gravity="center"
+                android:text="@string/game_empty"
+                android:textColor="@color/launcher_text_muted_color"
+                android:textSize="@dimen/launcher_library_empty_text_size"
+                android:visibility="gone" />
+        </FrameLayout>
+    </LinearLayout>
+</FrameLayout>

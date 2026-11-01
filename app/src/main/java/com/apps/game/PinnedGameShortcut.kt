@@ -1,0 +1,179 @@
+package com.apps.game
+
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ShortcutInfo
+import android.content.pm.ShortcutManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.drawable.Icon
+import android.net.Uri
+import android.os.Build
+import android.util.LruCache
+import android.widget.Toast
+import com.apps.LauncherActivity
+import com.apps.LauncherIntents
+import com.core.R
+import com.core.data.GameRepository
+import com.core.launcherbridge.LauncherGameLaunchBridge
+import com.core.model.Game
+import com.core.util.AppExecutors
+import com.core.util.RxMainScheduler
+
+/** Creates and handles Android pinned shortcuts for individual library games. */
+object PinnedGameShortcut {
+    private const val SHORTCUT_ID_PREFIX = "game_"
+    private const val MAX_ICON_SIZE_PX = 192
+
+    /**
+     * 图标位图缓存（按封面源 URI 键控），避免重复 IO 解码。
+     * 驱逐时仅丢弃引用交由 GC 回收，不主动 recycle，避免并发 Icon 仍引用已回收位图。
+     */
+    private val iconCache = LruCache<String, Bitmap>(8)
+
+    /**
+     * 清空图标位图缓存（内存压力时调用，见 LauncherActivity.onTrimMemory 方案 A）。
+     * 驱逐仅丢弃引用交由 GC 回收，不主动 recycle。
+     */
+    @JvmStatic
+    fun clearIconCache() {
+        iconCache.evictAll()
+    }
+
+    interface LaunchCallback {
+        fun onResult(result: LauncherGameLaunchBridge.LaunchResult)
+    }
+
+    @JvmStatic
+    fun requestPinShortcut(context: Context, game: Game?) {
+        if (game == null || game.id <= 0L) return
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+            Toast.makeText(context, R.string.game_shortcut_android_unsupported, Toast.LENGTH_SHORT).show()
+            return
+        }
+        val manager = context.getSystemService(ShortcutManager::class.java)
+        if (manager == null || !manager.isRequestPinShortcutSupported) {
+            Toast.makeText(context, R.string.game_shortcut_launcher_unsupported, Toast.LENGTH_SHORT).show()
+            return
+        }
+        val title = game.title?.trim().takeUnless { it.isNullOrEmpty() }
+            ?: context.getString(R.string.game_unnamed)
+        val intent = Intent(context, LauncherActivity::class.java)
+            .setAction(LauncherIntents.ACTION_LAUNCH_PINNED_GAME)
+            .putExtra(LauncherIntents.EXTRA_PINNED_GAME_ID, game.id)
+            .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        // 图标解码含文件 IO（openInputStream/decodeFile）与位图缩放，移入 IO 线程并走缓存（§5.2 项 4）。
+        val appContext = context.applicationContext
+        AppExecutors.runOnIo {
+            val icon = shortcutIcon(appContext, game)
+            RxMainScheduler.post {
+                val shortcut = ShortcutInfo.Builder(appContext, SHORTCUT_ID_PREFIX + game.id)
+                    .setShortLabel(title)
+                    .setLongLabel(title)
+                    .setIntent(intent)
+                    .setIcon(icon)
+                    .build()
+                try {
+                    manager.requestPinShortcut(shortcut, null)
+                } catch (e: IllegalStateException) {
+                    // 解码窗口期应用可能已不在前台，系统拒绝置顶请求时忽略，避免崩溃
+                    android.util.Log.w("PinnedGameShortcut", "requestPinShortcut rejected", e)
+                }
+                // 用已捕获的 appContext 弹 Toast，避免 IO 期间 Activity 销毁导致 context 泄漏
+                Toast.makeText(appContext, R.string.game_shortcut_confirm_system, Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    /** Resolves the current game by id before delegating to the shared launch bridge. */
+    @JvmStatic
+    fun launchPinnedGame(context: Context, gameId: Long, callback: LaunchCallback?) {
+        launchPinnedGame(context, gameId, null, callback)
+    }
+
+    /**
+     * Uses the shared session controller when the shortcut is launched from an Activity,
+     * allowing realtime server sessions to receive heartbeats and a finish event on return.
+     */
+    @JvmStatic
+    fun launchPinnedGame(context: Context, gameId: Long, sessionController: GameSessionController?, callback: LaunchCallback?) {
+        if (gameId <= 0L) {
+            callback?.onResult(LauncherGameLaunchBridge.LaunchResult.failure(
+                context.getString(R.string.game_shortcut_invalid)))
+            return
+        }
+        val appContext = context.applicationContext
+        AppExecutors.runOnIo {
+            val game = GameRepository(appContext).findById(gameId)
+            if (game == null) {
+                val result = LauncherGameLaunchBridge.LaunchResult.failure(
+                    context.getString(R.string.game_not_found))
+                RxMainScheduler.post { callback?.onResult(result) }
+                return@runOnIo
+            }
+            if (sessionController == null) {
+                // 无会话宿主时无 Activity 上下文可弹 ask 确认框：ask 策略回退为静默解包，避免功能回退。
+                if (LauncherGameLaunchBridge.needsArtemisBasePatchConfirmation(appContext, game)) {
+                    LauncherGameLaunchBridge.applyArtemisBasePatch(game)
+                }
+                val result = LauncherGameLaunchBridge.launch(appContext, game)
+                RxMainScheduler.post { callback?.onResult(result) }
+                return@runOnIo
+            }
+            sessionController.launchGame(appContext, game) { result -> callback?.onResult(result) }
+        }
+    }
+
+    private fun shortcutIcon(context: Context, game: Game): Icon {
+        val source = game.coverPersistUri?.trim().takeUnless { it.isNullOrEmpty() }
+            ?: game.coverUri?.trim().takeUnless { it.isNullOrEmpty() }
+        if (source != null) {
+            // LruCache 内部自带同步，无需外部加锁
+            iconCache.get(source)?.let { return Icon.createWithBitmap(it) }
+            val decoded = decodeShortcutBitmap(context, source)
+            if (decoded != null) {
+                iconCache.put(source, decoded)
+                return Icon.createWithBitmap(decoded)
+            }
+        }
+        return Icon.createWithResource(context, R.mipmap.ic_launcher)
+    }
+
+    private fun decodeShortcutBitmap(context: Context, source: String): Bitmap? {
+        return try {
+            val uri = Uri.parse(source)
+            val decoded = if (uri.scheme == "file") {
+                BitmapFactory.decodeFile(uri.path)
+            } else {
+                context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it) }
+            } ?: return null
+            // 桌面图标使用中心裁剪的正方形，避免将竖版或横版封面挤压变形。
+            val edge = minOf(decoded.width, decoded.height)
+            val square = if (decoded.width == decoded.height) {
+                decoded
+            } else {
+                Bitmap.createBitmap(
+                    decoded,
+                    (decoded.width - edge) / 2,
+                    (decoded.height - edge) / 2,
+                    edge,
+                    edge
+                ).also { decoded.recycle() }
+            }
+            if (square.width <= MAX_ICON_SIZE_PX) return square
+            val scale = MAX_ICON_SIZE_PX.toFloat() / square.width
+            val scaled = Bitmap.createScaledBitmap(
+                square,
+                (square.width * scale).toInt().coerceAtLeast(1),
+                (square.height * scale).toInt().coerceAtLeast(1),
+                true
+            )
+            square.recycle()
+            scaled
+        } catch (error: OutOfMemoryError) {
+            throw error
+        } catch (_: Exception) {
+            null
+        }
+    }
+}
